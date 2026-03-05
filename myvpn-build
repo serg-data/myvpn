@@ -1,0 +1,228 @@
+#!/bin/sh
+
+BASE="/etc/myvpn"
+OUT="/etc/sing-box-config.json"
+NODES="$BASE/nodes.json"
+URLTEST="$BASE/urltest.conf"
+
+STATE=$(cat "$BASE/current_state" 2>/dev/null)
+[ -z "$STATE" ] && STATE="primary"
+
+if [ "$STATE" = "backup" ]; then
+    MODE="global"
+    PROFILE_TYPE=$(cat "$BASE/backup_profile_type" 2>/dev/null)
+    ACTIVE_NODE=$(cat "$BASE/backup_node" 2>/dev/null)
+    CUSTOM_FILE="$BASE/backup_profile_nodes.json"
+else
+    MODE=$(cat "$BASE/mode" 2>/dev/null)
+    PROFILE_TYPE=$(cat "$BASE/profile_type" 2>/dev/null)
+    ACTIVE_NODE=$(cat "$BASE/active_node" 2>/dev/null)
+    CUSTOM_FILE="$BASE/profile_nodes.json"
+fi
+
+[ -z "$MODE" ] && MODE="shunt"
+[ -z "$PROFILE_TYPE" ] && PROFILE_TYPE="single"
+
+# ================= DNS =================
+
+DNS_PROVIDER=$(cat "$BASE/dns_provider" 2>/dev/null)
+DNS_PROTOCOL=$(cat "$BASE/dns_protocol" 2>/dev/null)
+DNS_STRATEGY=$(cat "$BASE/dns_strategy" 2>/dev/null)
+FAKE_DNS=$(cat "$BASE/fake_dns" 2>/dev/null)
+
+[ -z "$DNS_PROVIDER" ] && DNS_PROVIDER="cloudflare"
+[ -z "$DNS_PROTOCOL" ] && DNS_PROTOCOL="doh"
+[ -z "$DNS_STRATEGY" ] && DNS_STRATEGY="prefer_ipv4"
+[ -z "$FAKE_DNS" ] && FAKE_DNS="off"
+
+case "$DNS_PROVIDER" in
+    cloudflare) DNS_SERVER="1.1.1.1" ;;
+    google) DNS_SERVER="8.8.8.8" ;;
+    quad9) DNS_SERVER="9.9.9.9" ;;
+esac
+
+# ================= URLTEST SETTINGS =================
+
+if [ -f "$URLTEST" ]; then
+    INTERVAL=$(grep '^interval=' "$URLTEST" | cut -d= -f2)
+    TOLERANCE=$(grep '^tolerance=' "$URLTEST" | cut -d= -f2)
+    TESTURL=$(grep '^test_url=' "$URLTEST" | cut -d= -f2)
+fi
+
+[ -z "$INTERVAL" ] && INTERVAL="3m"
+[ -z "$TOLERANCE" ] && TOLERANCE="150"
+[ -z "$TESTURL" ] && TESTURL="https://1.1.1.1/generate_204"
+
+# ================= SELECT NODES =================
+
+if [ "$PROFILE_TYPE" = "single" ]; then
+    GROUP_NODES=$(jq -c ".[] | select(.tag==\"$ACTIVE_NODE\")" "$NODES")
+elif [ "$PROFILE_TYPE" = "custom" ] && [ -f "$CUSTOM_FILE" ]; then
+    GROUP_NODES=$(jq -c --argfile tags "$CUSTOM_FILE" '.[] | select(.tag as $t | $tags | index($t))' "$NODES")
+fi
+
+[ -z "$GROUP_NODES" ] && GROUP_NODES=$(jq -c '.[0]' "$NODES")
+
+if [ -z "$GROUP_NODES" ] || [ "$GROUP_NODES" = "null" ]; then
+    echo "No nodes available"
+    exit 1
+fi
+
+# ================= PREPROXY =================
+
+if [ -f "$BASE/preproxy_node" ]; then
+    PREPROXY_TAG=$(cat "$BASE/preproxy_node")
+    PREPROXY_NODE=$(jq -c ".[] | select(.tag==\"$PREPROXY_TAG\")" "$NODES")
+else
+    PREPROXY_NODE=""
+fi
+
+if [ -z "$PREPROXY_NODE" ]; then
+    PREPROXY_JSON="[]"
+else
+    PREPROXY_JSON="[$PREPROXY_NODE]"
+fi
+
+# ================= ROUTING =================
+
+IPS=$(grep -v '^#' "$BASE/rules.conf" | grep '/' | jq -R . | jq -s .)
+DOMAINS=$(grep -v '^#' "$BASE/rules.conf" | grep -v '/' | grep -v '^$' | jq -R . | jq -s .)
+
+# ================= BUILD =================
+
+jq -n \
+--argjson nodes "[$GROUP_NODES]" \
+--argjson preproxy "$PREPROXY_JSON" \
+--arg dns_server "$DNS_SERVER" \
+--arg dns_protocol "$DNS_PROTOCOL" \
+--arg dns_strategy "$DNS_STRATEGY" \
+--arg fake_dns "$FAKE_DNS" \
+--argjson ips "$IPS" \
+--argjson domains "$DOMAINS" \
+--arg mode "$MODE" \
+--arg profile_type "$PROFILE_TYPE" \
+--arg interval "$INTERVAL" \
+--arg tolerance "$TOLERANCE" \
+--arg test_url "$TESTURL" '
+
+def proxy_detour:
+  if ($preproxy | length) > 0 then {detour:"preproxy"} else {} end;
+
+{
+log:{level:"warn"},
+
+dns:{
+  strategy:$dns_strategy,
+  servers:[
+    if $dns_protocol=="doh" then
+      {
+        tag:"dns-remote",
+        type:"https",
+        server:$dns_server,
+        path:"/dns-query",
+        detour:"proxy"
+      }
+    else
+      {
+        tag:"dns-remote",
+        type:"tls",
+        server:$dns_server,
+        detour:"proxy"
+      }
+    end
+  ]
+}
++
+(
+ if $fake_dns=="on" then
+  {fakeip:{enabled:true,inet4_range:"198.18.0.0/15"}}
+ else {} end
+)
+,
+
+inbounds:[
+ {
+  type:"tun",
+  tag:"tun-in",
+  interface_name:"tun0",
+  address:["172.19.0.1/30"],
+  auto_route:true,
+  strict_route:true
+ }
+],
+
+outbounds:
+(
+  (
+    if ($preproxy | length) > 0 then
+      ($preproxy | map({
+        type:.type,
+        tag:"preproxy",
+        server:.server,
+        server_port:.server_port,
+        uuid:.uuid,
+        flow:.flow,
+        tls:.tls
+      }))
+    else []
+    end
+  )
+  +
+  (
+    if $profile_type=="single" then
+      (
+        $nodes | map(
+          {
+            type:.type,
+            tag:"proxy",
+            server:.server,
+            server_port:.server_port,
+            uuid:.uuid,
+            flow:.flow,
+            tls:.tls
+          } + proxy_detour
+        )
+      )
+    else
+      (
+        $nodes | map({
+          type:.type,
+          tag:.tag,
+          server:.server,
+          server_port:.server_port,
+          uuid:.uuid,
+          flow:.flow,
+          tls:.tls
+        })
+        +
+        [{
+          type:"urltest",
+          tag:"proxy",
+          outbounds:($nodes | map(.tag)),
+          url:$test_url,
+          interval:$interval,
+          tolerance:($tolerance|tonumber)
+        } + proxy_detour]
+      )
+    end
+  )
+),
+
+route:
+(
+ if $mode=="global" then
+  {rules:[ {action:"route", outbound:"proxy"} ]}
+ else
+  {rules:[
+    {ip_cidr:$ips, action:"direct"},
+    {domain_suffix:$domains, action:"direct"},
+    {action:"route", outbound:"proxy"}
+  ]}
+ end
+)
+
+}
+' > "$OUT"
+
+jq empty "$OUT" || exit 1
+echo "config built: $OUT"

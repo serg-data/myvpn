@@ -1,0 +1,31 @@
+#!/bin/sh
+
+BASE="/etc/myvpn"
+
+RUN_MODE=$(cat "$BASE/run_mode" 2>/dev/null)
+[ "$RUN_MODE" != "auto" ] && exit 0
+
+# ================= LTE BLINK PROTECTION =================
+
+ip route | grep -q '^default' || exit 0
+
+# ================= CHECK SING-BOX =================
+
+if ! pgrep sing-box >/dev/null; then
+    /usr/bin/myvpn-apply
+    exit 0
+fi
+
+# ================= CHECK TUN TRAFFIC =================
+# Проверяем доступ через туннель
+
+if wget -4 -q -T5 -O /dev/null http://detectportal.firefox.com/success.txt; then
+    exit 0
+fi
+
+# ================= SOFT RESTART =================
+
+pkill sing-box
+sleep 1
+/usr/bin/myvpn-apply
+

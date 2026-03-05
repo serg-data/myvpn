@@ -1,0 +1,728 @@
+#!/bin/sh
+
+BASE="/etc/myvpn"
+NODES="$BASE/nodes.json"
+SUBS="$BASE/subscriptions"
+RULES="$BASE/rules.conf"
+FAILCONF="$BASE/failover.conf"
+
+apply() {
+ /usr/bin/myvpn-apply >/dev/null 2>&1
+ echo "Configuration applied."
+}
+
+node_name() {
+jq -r --arg t "$1" '.[] | select(.tag==$t) | (.remark // .name // .tag)' "$NODES" | head -n1
+}
+
+node_list() {
+jq -r '.[] | "\(.remark // .name // .tag) \(.server):\(.server_port)"' "$NODES" | nl
+}
+
+node_tag_by_index() {
+jq -r ".[($1-1)].tag" "$NODES"
+}
+
+# ================= STATUS =================
+
+show_status() {
+
+STATE=$(cat $BASE/current_state 2>/dev/null)
+RUN=$(cat $BASE/run_mode 2>/dev/null)
+MODE=$(cat $BASE/mode 2>/dev/null)
+
+PT=$(cat $BASE/profile_type 2>/dev/null)
+BT=$(cat $BASE/backup_profile_type 2>/dev/null)
+
+PRE=$(cat $BASE/preproxy_node 2>/dev/null)
+
+FO=$(grep '^enabled=' "$FAILCONF" 2>/dev/null | cut -d= -f2)
+[ "$FO" = "1" ] && FO="enabled" || FO="disabled"
+
+echo ""
+echo "========== MYVPN STATUS =========="
+echo ""
+
+echo "State:           $STATE"
+echo "Run mode:        $RUN"
+echo "Connection mode: $MODE"
+echo "Failover:        $FO"
+
+echo ""
+echo "Primary:"
+echo "  type: $PT"
+
+if [ "$PT" = "custom" ] && [ -f "$BASE/profile_nodes.json" ]; then
+
+echo "  nodes:"
+
+while IFS= read -r TAG
+do
+[ -z "$TAG" ] && continue
+NAME=$(node_name "$TAG")
+[ -n "$NAME" ] && echo "   - $NAME"
+done < "$BASE/profile_nodes.json"
+
+else
+
+TAG=$(cat "$BASE/active_node" 2>/dev/null)
+NAME=$(node_name "$TAG")
+
+echo "  node:"
+echo "   - $NAME"
+
+fi
+
+echo ""
+echo "Backup:"
+echo "  type: $BT"
+
+if [ "$BT" = "custom" ] && [ -f "$BASE/backup_profile_nodes.json" ]; then
+
+echo "  nodes:"
+
+while IFS= read -r TAG
+do
+[ -z "$TAG" ] && continue
+NAME=$(node_name "$TAG")
+[ -n "$NAME" ] && echo "   - $NAME"
+done < "$BASE/backup_profile_nodes.json"
+
+else
+
+TAG=$(cat "$BASE/backup_node" 2>/dev/null)
+NAME=$(node_name "$TAG")
+
+echo "  node:"
+echo "   - $NAME"
+
+fi
+
+echo ""
+
+if [ -z "$PRE" ]; then
+echo "Preproxy:        disabled"
+else
+echo "Preproxy:        $(node_name "$PRE")"
+fi
+
+echo ""
+echo "DNS provider:    $(cat $BASE/dns_provider 2>/dev/null)"
+echo "DNS protocol:    $(cat $BASE/dns_protocol 2>/dev/null)"
+echo "DNS strategy:    $(cat $BASE/dns_strategy 2>/dev/null)"
+
+echo ""
+echo "=================================="
+echo ""
+
+read -p "Press Enter to continue..."
+}
+
+# ================= TCP TEST =================
+
+tcp_test() {
+
+echo ""
+echo "Testing nodes..."
+
+jq -r '.[] | "\(.remark // .name // .tag)|\(.server)|\(.server_port)"' "$NODES" |
+while IFS="|" read NAME SERVER PORT
+do
+
+LAT=$( (time -p nc -z -w3 "$SERVER" "$PORT") 2>&1 | awk '/real/ {print int($2*1000)}' )
+
+if nc -z -w3 "$SERVER" "$PORT" >/dev/null 2>&1; then
+echo "[OK]   $NAME (${LAT} ms)"
+else
+echo "[FAIL] $NAME"
+fi
+
+done
+
+echo ""
+read -p "Press Enter to continue..."
+}
+
+# ================= STATE =================
+
+state_menu() {
+
+while true
+do
+echo ""
+echo "State"
+echo "1) Primary"
+echo "2) Backup"
+echo "0) Back"
+echo ""
+
+read -p "Select state: " S
+
+case "$S" in
+
+1)
+echo primary > "$BASE/current_state"
+apply
+;;
+
+2)
+echo backup > "$BASE/current_state"
+apply
+;;
+
+0)
+return
+;;
+
+*)
+echo "Invalid selection"
+;;
+
+esac
+done
+}
+
+# ================= ADVANCED =================
+
+advanced_menu() {
+
+while true
+do
+
+RUN=$(cat "$BASE/run_mode" 2>/dev/null)
+
+echo ""
+echo "Advanced"
+echo "1) Run mode ($RUN)"
+echo "2) Rebuild config"
+echo "0) Back"
+echo ""
+
+read -p "Select: " A
+
+case "$A" in
+
+1)
+echo ""
+echo "Run mode"
+echo "1) manual"
+echo "2) auto"
+echo ""
+
+read -p "Select: " M
+
+case "$M" in
+1) echo manual > "$BASE/run_mode" ;;
+2) echo auto > "$BASE/run_mode" ;;
+esac
+;;
+
+2)
+/usr/bin/myvpn-build
+apply
+;;
+
+0)
+return
+;;
+
+*)
+echo "Invalid selection"
+;;
+
+esac
+done
+}
+
+# ================= DNS =================
+
+dns_menu() {
+
+while true
+do
+
+PROV=$(cat "$BASE/dns_provider" 2>/dev/null)
+PROTO=$(cat "$BASE/dns_protocol" 2>/dev/null)
+STRAT=$(cat "$BASE/dns_strategy" 2>/dev/null)
+FAKE=$(cat "$BASE/fake_dns" 2>/dev/null)
+
+[ -z "$FAKE" ] && FAKE="off"
+
+echo ""
+echo "DNS"
+echo "1) Show settings"
+echo "2) Strategy ($STRAT)"
+echo "3) Protocol ($PROTO)"
+echo "4) Provider ($PROV)"
+echo "5) FakeIP ($FAKE)"
+echo "0) Back"
+echo ""
+
+read -p "Select: " D
+
+case "$D" in
+
+1)
+echo ""
+echo "Provider: $PROV"
+echo "Protocol: $PROTO"
+echo "Strategy: $STRAT"
+echo "FakeIP: $FAKE"
+read -p "Press Enter..."
+;;
+
+2)
+echo ""
+echo "1) ipv4_only"
+echo "2) prefer_ipv4"
+read -p "Select: " S
+[ "$S" = "1" ] && echo ipv4_only > "$BASE/dns_strategy"
+[ "$S" = "2" ] && echo prefer_ipv4 > "$BASE/dns_strategy"
+apply
+;;
+
+3)
+echo ""
+echo "1) doh"
+echo "2) udp"
+read -p "Select: " P
+[ "$P" = "1" ] && echo doh > "$BASE/dns_protocol"
+[ "$P" = "2" ] && echo udp > "$BASE/dns_protocol"
+apply
+;;
+
+4)
+echo ""
+echo "1) cloudflare"
+echo "2) google"
+echo "3) quad9"
+read -p "Select: " V
+[ "$V" = "1" ] && echo cloudflare > "$BASE/dns_provider"
+[ "$V" = "2" ] && echo google > "$BASE/dns_provider"
+[ "$V" = "3" ] && echo quad9 > "$BASE/dns_provider"
+apply
+;;
+
+5)
+
+if [ "$FAKE" = "on" ]; then
+echo off > "$BASE/fake_dns"
+else
+echo on > "$BASE/fake_dns"
+fi
+
+apply
+;;
+
+0)
+return
+;;
+
+*)
+echo "Invalid selection"
+;;
+
+esac
+done
+}
+
+
+# ================= CORE =================
+
+core_menu() {
+
+while true
+do
+
+echo ""
+echo "Core"
+echo "1) Status"
+echo "2) Start"
+echo "3) Stop"
+echo "4) Restart"
+echo "0) Back"
+echo ""
+
+read -p "Select: " C
+
+case "$C" in
+
+1)
+pgrep sing-box >/dev/null && echo "sing-box running" || echo "sing-box stopped"
+read -p "Press Enter..."
+;;
+
+2)
+/usr/bin/myvpn-apply
+;;
+
+3)
+killall sing-box
+;;
+
+4)
+killall sing-box
+sleep 1
+/usr/bin/myvpn-apply
+;;
+
+0)
+return
+;;
+
+*)
+echo "Invalid selection"
+;;
+
+esac
+done
+}
+
+# ================= FAILOVER =================
+
+failover_menu() {
+
+while true
+do
+
+EN=$(grep '^enabled=' "$FAILCONF" 2>/dev/null | cut -d= -f2)
+LTE=$(grep '^lte_mode=' "$FAILCONF" 2>/dev/null | cut -d= -f2)
+FAIL=$(grep '^fail_limit=' "$FAILCONF" 2>/dev/null | cut -d= -f2)
+OK=$(grep '^ok_limit=' "$FAILCONF" 2>/dev/null | cut -d= -f2)
+SITE=$(grep '^site_fail_limit=' "$FAILCONF" 2>/dev/null | cut -d= -f2)
+INT=$(grep '^interval=' "$FAILCONF" 2>/dev/null | cut -d= -f2)
+
+echo ""
+echo "Failover"
+echo "1) Enable / Disable ($EN)"
+echo "2) LTE mode ($LTE)"
+echo "3) Fail limit ($FAIL)"
+echo "4) OK limit ($OK)"
+echo "5) Site fail limit ($SITE)"
+echo "6) Check interval ($INT)"
+echo "0) Back"
+echo ""
+
+read -p "Select: " F
+
+case "$F" in
+
+1)
+if [ "$EN" = "1" ]; then
+sed -i 's/enabled=.*/enabled=0/' "$FAILCONF"
+else
+sed -i 's/enabled=.*/enabled=1/' "$FAILCONF"
+fi
+;;
+
+2)
+if [ "$LTE" = "1" ]; then
+sed -i 's/lte_mode=.*/lte_mode=0/' "$FAILCONF"
+else
+sed -i 's/lte_mode=.*/lte_mode=1/' "$FAILCONF"
+fi
+;;
+
+3)
+read -p "Enter fail limit: " V
+sed -i "s/fail_limit=.*/fail_limit=$V/" "$FAILCONF"
+;;
+
+4)
+read -p "Enter OK limit: " V
+sed -i "s/ok_limit=.*/ok_limit=$V/" "$FAILCONF"
+;;
+
+5)
+read -p "Enter site fail limit: " V
+sed -i "s/site_fail_limit=.*/site_fail_limit=$V/" "$FAILCONF"
+;;
+
+6)
+read -p "Enter interval seconds: " V
+sed -i "s/interval=.*/interval=$V/" "$FAILCONF"
+;;
+
+0)
+return
+;;
+
+*)
+echo "Invalid selection"
+;;
+
+esac
+done
+}
+
+# ================= URLTEST SETTINGS =================
+
+urltest_settings_menu() {
+
+CONF="$BASE/urltest.conf"
+
+INTERVAL=$(grep '^interval=' "$CONF" 2>/dev/null | cut -d= -f2)
+TOL=$(grep '^tolerance=' "$CONF" 2>/dev/null | cut -d= -f2)
+URL=$(grep '^test_url=' "$CONF" 2>/dev/null | cut -d= -f2)
+
+[ -z "$INTERVAL" ] && INTERVAL="3m"
+[ -z "$TOL" ] && TOL="150"
+[ -z "$URL" ] && URL="https://1.1.1.1/generate_204"
+
+while true
+do
+
+echo ""
+echo "URLTest settings"
+echo "1) Interval ($INTERVAL)"
+echo "2) Tolerance ($TOL)"
+echo "3) Test URL ($URL)"
+echo "0) Back"
+echo ""
+
+read -p "Select: " U
+
+case "$U" in
+
+1)
+read -p "Enter interval (example: 30s 1m 3m): " V
+[ -n "$V" ] && sed -i "s/^interval=.*/interval=$V/" "$CONF" 2>/dev/null || echo "interval=$V" >> "$CONF"
+;;
+
+2)
+read -p "Enter tolerance ms: " V
+[ -n "$V" ] && sed -i "s/^tolerance=.*/tolerance=$V/" "$CONF" 2>/dev/null || echo "tolerance=$V" >> "$CONF"
+;;
+
+3)
+
+echo ""
+echo "Test URL"
+echo "1) Cloudflare"
+echo "2) Google"
+echo "3) Custom"
+echo ""
+
+read -p "Select: " T
+
+case "$T" in
+1) V="https://1.1.1.1/generate_204" ;;
+2) V="https://www.gstatic.com/generate_204" ;;
+3) read -p "Enter URL: " V ;;
+*) continue ;;
+esac
+
+[ -n "$V" ] && sed -i "s|^test_url=.*|test_url=$V|" "$CONF" 2>/dev/null || echo "test_url=$V" >> "$CONF"
+;;
+
+0)
+return
+;;
+
+*)
+echo "Invalid selection"
+;;
+
+esac
+
+done
+}
+
+# ===== оригинальные меню ниже =====
+
+primary_menu() {
+while true
+do
+
+MODE=$(cat "$BASE/mode" 2>/dev/null)
+[ -z "$MODE" ] && MODE="shunt"
+
+echo ""
+echo "Primary profile"
+echo "1) Single node"
+echo "2) URLTest group"
+echo "3) URLTest settings"
+echo "4) Mode ($MODE)"
+echo "0) Back"
+echo ""
+
+read -p "Select option: " P
+
+case "$P" in
+
+1)
+echo ""
+echo "Available nodes:"
+node_list
+echo ""
+echo "Enter node number (0 cancel)"
+read -p "Node: " N
+[ "$N" = "0" ] && continue
+TAG=$(node_tag_by_index "$N")
+echo single > "$BASE/profile_type"
+echo "$TAG" > "$BASE/active_node"
+apply
+;;
+
+2)
+echo ""
+echo "Available nodes:"
+node_list
+echo ""
+echo "Enter numbers separated by SPACE"
+read -p "Nodes: " LIST
+[ -z "$LIST" ] && continue
+> "$BASE/profile_nodes.json"
+for N in $LIST; do
+TAG=$(node_tag_by_index "$N")
+[ -n "$TAG" ] && echo "$TAG" >> "$BASE/profile_nodes.json"
+done
+echo custom > "$BASE/profile_type"
+apply
+;;
+
+3)
+urltest_settings_menu
+;;
+
+4)
+
+echo ""
+echo "Connection mode"
+echo "1) Shunt"
+echo "2) Global"
+echo ""
+
+read -p "Select: " M
+
+case "$M" in
+1) echo shunt > "$BASE/mode" ;;
+2) echo global > "$BASE/mode" ;;
+esac
+
+apply
+;;
+
+0)
+return
+;;
+
+*)
+echo "Invalid selection"
+;;
+
+esac
+done
+}
+
+backup_menu() {
+while true
+do
+echo ""
+echo "Backup profile"
+echo "1) Single node"
+echo "2) URLTest group"
+echo "3) URLTest settings"
+echo "0) Back"
+echo ""
+
+read -p "Select option: " B
+
+case "$B" in
+
+1)
+echo ""
+echo "Available nodes:"
+node_list
+echo ""
+read -p "Node: " N
+[ "$N" = "0" ] && continue
+TAG=$(node_tag_by_index "$N")
+echo single > "$BASE/backup_profile_type"
+echo "$TAG" > "$BASE/backup_node"
+apply
+;;
+
+2)
+echo ""
+echo "Available nodes:"
+node_list
+echo ""
+echo "Enter numbers separated by SPACE"
+read -p "Nodes: " LIST
+[ -z "$LIST" ] && continue
+> "$BASE/backup_profile_nodes.json"
+for N in $LIST; do
+TAG=$(node_tag_by_index "$N")
+[ -n "$TAG" ] && echo "$TAG" >> "$BASE/backup_profile_nodes.json"
+done
+echo custom > "$BASE/backup_profile_type"
+apply
+;;
+
+3)
+urltest_settings_menu
+;;
+
+0)
+return
+;;
+
+*)
+echo "Invalid selection"
+;;
+
+esac
+done
+}
+
+preproxy_menu() { while true; do echo ""; echo "Preproxy"; echo "1) Disable"; echo "2) Select node"; echo "0) Back"; echo ""; read -p "Select option: " P; case "$P" in 1) rm -f "$BASE/preproxy_node"; apply ;; 2) echo ""; echo "Available nodes:"; node_list; echo ""; read -p "Node: " N; TAG=$(node_tag_by_index "$N"); echo "$TAG" > "$BASE/preproxy_node"; apply ;; 0) return ;; *) echo "Invalid selection" ;; esac; done }
+
+nodes_menu() { while true; do echo ""; echo "Nodes"; echo "1) List nodes"; echo "2) TCP test nodes"; echo "3) Preproxy"; echo "0) Back"; echo ""; read -p "Select: " N; case "$N" in 1) node_list; read -p "Press Enter..." ;; 2) tcp_test ;; 3) preproxy_menu ;; 0) return ;; *) echo "Invalid selection" ;; esac; done }
+
+rules_menu() { while true; do echo ""; echo "Rules (direct whitelist)"; echo "1) Show rules"; echo "2) Add rule"; echo "3) Delete rule"; echo "0) Back"; echo ""; read -p "Select: " R; case "$R" in 1) nl "$RULES"; read -p "Press Enter..." ;; 2) read -p "Enter domain or CIDR: " V; echo "$V" >> "$RULES"; apply ;; 3) nl "$RULES"; read -p "Line to delete: " L; sed -i "${L}d" "$RULES"; apply ;; 0) return ;; *) echo "Invalid selection" ;; esac; done }
+
+subs_menu() { while true; do echo ""; echo "Subscriptions"; echo "1) Show"; echo "2) Add"; echo "3) Delete"; echo "4) Update now"; echo "0) Back"; echo ""; read -p "Select: " S; case "$S" in 1) nl "$SUBS"; read -p "Press Enter..." ;; 2) read -p "Enter subscription URL: " U; echo "$U" >> "$SUBS" ;; 3) nl "$SUBS"; read -p "Line: " L; sed -i "${L}d" "$SUBS" ;; 4) /usr/bin/myvpn-update; apply ;; 0) return ;; *) echo "Invalid selection" ;; esac; done }
+
+# ================= MAIN MENU =================
+
+while true
+do
+
+echo ""
+echo "MYVPN"
+echo "1) Status"
+echo "2) State"
+echo "3) Primary"
+echo "4) Backup"
+echo "5) Failover"
+echo "6) Nodes"
+echo "7) Rules"
+echo "8) Subscriptions"
+echo "9) Advanced"
+echo "10) DNS"
+echo "11) Core"
+echo "0) Exit"
+echo ""
+
+read -p "Select option: " CH
+
+case "$CH" in
+
+1) show_status ;;
+2) state_menu ;;
+3) primary_menu ;;
+4) backup_menu ;;
+5) failover_menu ;;
+6) nodes_menu ;;
+7) rules_menu ;;
+8) subs_menu ;;
+9) advanced_menu ;;
+10) dns_menu ;;
+11) core_menu ;;
+0) exit 0 ;;
+*) echo "Invalid selection" ;;
+
+esac
+
+done

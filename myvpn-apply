@@ -1,0 +1,55 @@
+#!/bin/sh
+
+CONFIG="/etc/sing-box-config.json"
+LOG="/tmp/singbox.log"
+
+echo "[MYVPN] Rebuilding config..."
+/usr/bin/myvpn-build || {
+    echo "[MYVPN] Build failed"
+    exit 1
+}
+
+echo "[MYVPN] Checking config..."
+sing-box check -c "$CONFIG" >/dev/null 2>&1 || {
+    echo "[MYVPN] Config invalid"
+    exit 1
+}
+
+echo "[MYVPN] Restarting sing-box..."
+
+# Stop if running
+if pgrep sing-box >/dev/null; then
+    killall sing-box
+    sleep 1
+fi
+
+# Start
+sing-box run -c "$CONFIG" >"$LOG" 2>&1 &
+sleep 2
+
+# Check process
+if ! pgrep sing-box >/dev/null; then
+    echo "[MYVPN] Failed to start sing-box"
+    exit 1
+fi
+
+# Check tun interface
+if ! ip link show tun0 >/dev/null 2>&1; then
+    echo "[MYVPN] tun0 not found — restarting..."
+    killall sing-box
+    sleep 1
+    sing-box run -c "$CONFIG" >"$LOG" 2>&1 &
+    sleep 2
+fi
+
+# Check default route (как Xray watchdog)
+if ! ip route | grep -q '^default'; then
+    echo "[MYVPN] Default route missing — restarting..."
+    killall sing-box
+    sleep 1
+    sing-box run -c "$CONFIG" >"$LOG" 2>&1 &
+    sleep 2
+fi
+
+echo "[MYVPN] Apply complete"
+

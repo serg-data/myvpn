@@ -1,0 +1,149 @@
+#!/bin/sh
+
+BASE="/etc/myvpn"
+OUT="$BASE/nodes.json"
+TMP="/tmp/myvpn_nodes.tmp"
+
+> "$TMP"
+
+while read LINE
+do
+    [ -z "$LINE" ] && continue
+
+    PREFIX=$(echo "$LINE" | cut -d'|' -f1)
+    URL=$(echo "$LINE" | cut -d'|' -f2)
+
+    if [ -z "$URL" ]; then
+        PREFIX="geo"
+        URL="$LINE"
+    fi
+
+    DATA=$(curl -s "$URL")
+
+    # Декодируем base64
+    DECODED=$(echo "$DATA" | base64 -d 2>/dev/null | tr -d '\r')
+
+    echo "$DECODED" | grep '^vless://' | while read URI
+    do
+        [ -z "$URI" ] && continue
+
+        TAG_RAW=$(echo "$URI" | cut -d'#' -f2)
+        NAME=$(printf '%b' "${TAG_RAW//%/\\x}")
+
+        SERVER=$(echo "$URI" | sed -n 's|.*@\([^:]*\):.*|\1|p')
+        PORT=$(echo "$URI" | sed -n 's|.*:\([0-9]*\)?.*|\1|p')
+        UUID=$(echo "$URI" | sed -n 's|vless://\([^@]*\)@.*|\1|p')
+
+        SNI=$(echo "$URI" | sed -n 's|.*sni=\([^&]*\).*|\1|p')
+        PBK=$(echo "$URI" | sed -n 's|.*pbk=\([^&]*\).*|\1|p')
+        SID=$(echo "$URI" | sed -n 's|.*sid=\([^&#]*\).*|\1|p')
+        FP=$(echo "$URI" | sed -n 's|.*fp=\([^&]*\).*|\1|p')
+
+        [ -z "$SNI" ] && SNI="$SERVER"
+        [ -z "$FP" ] && FP="chrome"
+
+        UUID_SHORT=$(echo "$UUID" | cut -c1-4)
+        SAFE_SERVER=$(echo "$SERVER" | tr '[:upper:]' '[:lower:]')
+        TAG="${PREFIX}-${SAFE_SERVER}-${PORT}-${UUID_SHORT}"
+
+        jq -n \
+        --arg tag "$TAG" \
+        --arg name "$NAME" \
+        --arg server "$SERVER" \
+        --arg uuid "$UUID" \
+        --arg sni "$SNI" \
+        --arg pbk "$PBK" \
+        --arg sid "$SID" \
+        --arg fp "$FP" \
+        --argjson port "$PORT" '
+        {
+          tag:$tag,
+          name:$name,
+          type:"vless",
+          server:$server,
+          server_port:$port,
+          uuid:$uuid,
+          flow:"xtls-rprx-vision",
+          tls:{
+            enabled:true,
+            server_name:$sni,
+            utls:{
+              enabled:true,
+              fingerprint:$fp
+            },
+            reality:
+            (
+              if ($pbk != "") then
+                (
+                  if ($sid | test("^[0-9a-fA-F]+$")) then
+                    {
+                      enabled:true,
+                      public_key:$pbk,
+                      short_id:$sid
+                    }
+                  else
+                    {
+                      enabled:true,
+                      public_key:$pbk
+                    }
+                  end
+                )
+              else null
+              end
+            )
+          }
+        }' >> "$TMP"
+
+    done
+
+done < "$BASE/subscriptions"
+
+# Если ничего не собрали — не перезаписываем nodes.json
+COUNT=$(wc -l < "$TMP")
+
+if [ "$COUNT" -eq 0 ]; then
+    echo "No nodes parsed. Keeping previous nodes.json"
+    rm "$TMP"
+    exit 1
+fi
+
+jq -s '.' "$TMP" > "$OUT"
+rm "$TMP"
+
+# ================= REMAP PRIMARY / BACKUP =================
+
+if [ "$(jq length "$OUT")" -gt 0 ]; then
+
+    FIRST_TAG=$(jq -r '.[0].tag' "$OUT")
+
+    # --- PRIMARY ---
+    CURRENT_PRIMARY=$(cat "$BASE/active_node" 2>/dev/null)
+
+    if [ -n "$CURRENT_PRIMARY" ]; then
+        EXISTS=$(jq -r --arg t "$CURRENT_PRIMARY" 'map(select(.tag==$t)) | length' "$OUT")
+    else
+        EXISTS=0
+    fi
+
+    if [ "$EXISTS" -eq 0 ]; then
+        echo "$FIRST_TAG" > "$BASE/active_node"
+        echo "Primary node remapped to $FIRST_TAG"
+    fi
+
+    # --- BACKUP ---
+    CURRENT_BACKUP=$(cat "$BASE/backup_node" 2>/dev/null)
+
+    if [ -n "$CURRENT_BACKUP" ]; then
+        EXISTS=$(jq -r --arg t "$CURRENT_BACKUP" 'map(select(.tag==$t)) | length' "$OUT")
+    else
+        EXISTS=0
+    fi
+
+    if [ "$EXISTS" -eq 0 ]; then
+        echo "$FIRST_TAG" > "$BASE/backup_node"
+        echo "Backup node remapped to $FIRST_TAG"
+    fi
+
+fi
+
+echo "subscriptions updated"

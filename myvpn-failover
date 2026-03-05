@@ -1,0 +1,99 @@
+#!/bin/sh
+
+BASE="/etc/myvpn"
+CONF="$BASE/failover.conf"
+
+[ -f "$CONF" ] || exit 0
+. "$CONF"
+
+[ "$enabled" = "1" ] || exit 0
+
+FAIL_FILE="/tmp/myvpn_fail.count"
+OK_FILE="/tmp/myvpn_ok.count"
+SITE_FAIL_FILE="/tmp/myvpn_site_fail.count"
+
+CURRENT_STATE=$(cat "$BASE/current_state" 2>/dev/null)
+
+log() {
+    logger -t myvpn-failover "$1"
+}
+
+restart_singbox() {
+    log "Restarting sing-box"
+    pkill sing-box
+    sleep 1
+    /usr/bin/myvpn-apply >/dev/null 2>&1
+}
+
+switch_state() {
+    NEW="$1"
+    log "Switching to $NEW"
+    echo "$NEW" > "$BASE/current_state"
+    /usr/bin/myvpn-apply >/dev/null 2>&1
+}
+
+check_wan() {
+
+    if [ "$lte_mode" = "1" ]; then
+        if ! ip route | grep -q '^default'; then
+            log "LTE blink detected"
+            return 2
+        fi
+    fi
+
+    ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && return 0
+    ping -c1 -W2 8.8.8.8 >/dev/null 2>&1 && return 0
+
+    return 1
+}
+
+check_site() {
+    wget -4 -q -T 8 -O /dev/null http://example.com && return 0
+    wget -4 -q -T 8 -O /dev/null http://detectportal.firefox.com/success.txt && return 0
+    return 1
+}
+
+check_wan
+WAN_RESULT=$?
+
+case "$WAN_RESULT" in
+
+0)
+    OK=$(($(cat "$OK_FILE" 2>/dev/null || echo 0) + 1))
+    echo "$OK" > "$OK_FILE"
+    echo 0 > "$FAIL_FILE"
+
+    check_site
+    SITE_RESULT=$?
+
+    if [ "$SITE_RESULT" != "0" ]; then
+        SITE_FAIL=$(($(cat "$SITE_FAIL_FILE" 2>/dev/null || echo 0) + 1))
+        echo "$SITE_FAIL" > "$SITE_FAIL_FILE"
+
+        if [ "$SITE_FAIL" -ge "$site_fail_limit" ]; then
+            restart_singbox
+            echo 0 > "$SITE_FAIL_FILE"
+        fi
+    else
+        echo 0 > "$SITE_FAIL_FILE"
+    fi
+
+    if [ "$OK" -ge "$ok_limit" ] && [ "$CURRENT_STATE" = "backup" ]; then
+        switch_state "primary"
+    fi
+;;
+
+1)
+    FAIL=$(($(cat "$FAIL_FILE" 2>/dev/null || echo 0) + 1))
+    echo "$FAIL" > "$FAIL_FILE"
+    echo 0 > "$OK_FILE"
+
+    if [ "$FAIL" -ge "$fail_limit" ] && [ "$CURRENT_STATE" = "primary" ]; then
+        switch_state "backup"
+    fi
+;;
+
+2)
+    ;;
+esac
+
